@@ -1,0 +1,175 @@
+name: build-macos-app
+
+run-name: Build for macOS
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.ref }}-macos
+  # Don't cancel a release run halfway through uploading or notarizing.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/prod' }}
+
+jobs:
+  build_macos:
+    runs-on: macos-26
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "~26.4.0"
+
+      - name: Run Tests
+        uses: Apple-Actions/xcodebuild@v1
+        with:
+          project: ExampleMac.xcodeproj
+          scheme: ExampleMac
+          configuration: Debug
+          sdk: macosx
+          destination: platform=macOS
+          action: test
+
+      - name: Import Code Signing Certificates
+        id: certs
+        if: github.ref == 'refs/heads/prod'
+        # One .p12 with Apple Distribution, Mac Installer Distribution and
+        # Developer ID Application.
+        uses: Apple-Actions/import-codesign-certs@v7
+        with:
+          p12-file-base64: ${{ secrets.APPSTORE_CERTIFICATES_FILE_BASE64 }}
+          p12-password: ${{ secrets.APPSTORE_CERTIFICATES_PASSWORD }}
+
+      - name: Download Provisioning Profiles
+        id: profiles
+        if: github.ref == 'refs/heads/prod'
+        # No profile-type: fetches both the AppStore (TestFlight) and
+        # DeveloperID (DMG) profiles for the bundle.
+        uses: Apple-Actions/download-provisioning-profiles@v7
+        with:
+          bundle-id: codes.orj.ExampleMac
+          issuer-id: ${{ vars.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ vars.APPSTORE_API_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+
+      - name: Check Provisioning Profiles
+        if: github.ref == 'refs/heads/prod'
+        env:
+          PROFILES: ${{ steps.profiles.outputs.profiles }}
+        run: |
+          set -euo pipefail
+          for name in "AppStore codes.orj.ExampleMac" "DeveloperID codes.orj.ExampleMac"; do
+            if ! jq -e --arg name "$name" 'any(.[]; .name == $name)' <<<"$PROFILES" >/dev/null; then
+              echo "::error::No ACTIVE provisioning profile \"$name\"; see \"One-time Apple setup\" in README.md"
+              exit 1
+            fi
+          done
+
+      - name: Archive and Export for App Store
+        id: build
+        if: github.ref == 'refs/heads/prod'
+        uses: Apple-Actions/xcodebuild@v1
+        with:
+          project: ExampleMac.xcodeproj
+          scheme: ExampleMac
+          sdk: macosx
+          action: archive
+          archive-path: .build/Artifacts/ExampleMac.xcarchive
+          export-options-plist: ExportOptions.plist
+          export-path: .build/Artifacts/app-store
+          build-number: ${{ github.run_number }}
+
+      # TestFlight runs before the DMG so a notary-service outage can't block
+      # it. To make re-running a failed job never upload twice instead, move
+      # this step after Notarize DMG.
+      - name: Upload TestFlight Build
+        if: github.ref == 'refs/heads/prod'
+        uses: Apple-Actions/upload-testflight-build@v5
+        with:
+          app-path: ${{ steps.build.outputs.pkg-path }}
+          app-type: macos
+          # The default appstore-api backend only uploads .ipa files.
+          backend: altool
+          issuer-id: ${{ vars.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ vars.APPSTORE_API_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+
+      - name: Export Developer ID
+        id: devid
+        if: github.ref == 'refs/heads/prod'
+        uses: Apple-Actions/xcodebuild@v1
+        with:
+          scheme: ExampleMac
+          action: export
+          archive-path: ${{ steps.build.outputs.archive-path }}
+          export-options-plist: ExportOptions-DeveloperID.plist
+          export-path: .build/Artifacts/developer-id
+
+      - name: Package DMG
+        id: dmg
+        if: github.ref == 'refs/heads/prod'
+        env:
+          APP_PATH: ${{ steps.devid.outputs.app-path }}
+        run: |
+          set -euo pipefail
+          version=$(awk -F= '/^MARKETING_VERSION/{gsub(/[ \t]/,"",$2); print $2}' Config/Shared.xcconfig)
+          dmg=".build/dmg/ExampleMac-${version}-${GITHUB_RUN_NUMBER}.dmg"
+          staging=".build/dmg/staging"
+          mkdir -p "$staging"
+          cp -R "$APP_PATH" "$staging/"
+          ln -s /Applications "$staging/Applications"
+          hdiutil create -format UDZO -volname "ExampleMac" -srcfolder "$staging" -ov "$dmg"
+          # A renewed Developer ID certificate keeps the same name, so sign by
+          # hash; a name would be ambiguous while both are in the keychain.
+          # Switch to import-codesign-certs' identities output once it exists.
+          identity=$(security find-identity -v -p codesigning | awk '/"Developer ID Application: .*\(ER9FN723RR\)"/ { print $2; exit }')
+          codesign --sign "$identity" --timestamp "$dmg"
+          echo "path=$dmg" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Notarize DMG
+        if: github.ref == 'refs/heads/prod'
+        uses: Apple-Actions/notarize@v1
+        with:
+          path: ${{ steps.dmg.outputs.path }}
+          issuer-id: ${{ vars.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ vars.APPSTORE_API_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+
+      - name: Upload DMG
+        if: github.ref == 'refs/heads/prod'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ExampleMac-dmg
+          path: ${{ steps.dmg.outputs.path }}
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: github.ref == 'refs/heads/prod'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DMG: ${{ steps.dmg.outputs.path }}
+          VERSION: ${{ steps.dmg.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release create "v${VERSION}-${GITHUB_RUN_NUMBER}" "$DMG" \
+            --target "$GITHUB_SHA" \
+            --title "ExampleMac ${VERSION} (${GITHUB_RUN_NUMBER})" \
+            --generate-notes
+
+      - name: Upload Logs
+        uses: actions/upload-artifact@v7
+        if: ${{ failure() || cancelled() }}
+        with:
+          name: logs
+          include-hidden-files: true
+          path: .build/*.log
+          if-no-files-found: error
