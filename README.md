@@ -2,10 +2,10 @@
 
 An example of how to use Apple development GitHub Actions to test a macOS app, upload it to TestFlight, and ship a notarized Developer ID DMG on a GitHub Release.
 
-The workflow lives at [`.github/workflows/build-macos-app.yml`](.github/workflows/build-macos-app.yml). On every push:
+The workflow lives at [`.github/workflows/build-macos-app.yml`](.github/workflows/build-macos-app.yml) and has two jobs:
 
-- All branches: run the unit tests (Debug, ad-hoc signed, no secrets needed). Forks and pull requests stop here.
-- `prod`: archive once, then export twice. The App Store export becomes a `.pkg` uploaded to TestFlight. The Developer ID export is packaged into a DMG, which is signed, notarized, stapled, uploaded as a workflow artifact, and attached to a GitHub Release.
+- `test`, on every push: run the unit tests (Debug, ad-hoc signed, no secrets needed). Forks and pull requests stop here.
+- `release`, on `prod` after `test` passes: archive once, then export twice. The App Store export becomes a `.pkg` uploaded to TestFlight. The Developer ID export is packaged into a DMG, which is signed, notarized, stapled, uploaded as a workflow artifact, and attached to a GitHub Release. Only this job gets `contents: write`.
 
 Build logs are uploaded as a workflow artifact on failure or cancellation.
 
@@ -16,21 +16,21 @@ flowchart LR
   profiles --> archive["xcodebuild archive + App Store export"]
   archive --> tf["upload-testflight-build"]
   tf --> devid["xcodebuild action: export (Developer ID)"]
-  devid --> dmg["hdiutil + codesign the DMG"]
+  devid --> dmg["create-dmg"]
   dmg --> notarize["notarize"]
   notarize --> release["upload-artifact + gh release"]
 ```
 
 | Step | Uses | Notes |
 | --- | --- | --- |
-| Run Tests | [`Apple-Actions/xcodebuild@v1`](https://github.com/Apple-Actions/xcodebuild) | `action: test`, `destination: platform=macOS`, Debug |
+| Run Tests (`test` job) | [`Apple-Actions/xcodebuild@v1`](https://github.com/Apple-Actions/xcodebuild) | `action: test`, `destination: platform=macOS`, Debug |
 | Import Code Signing Certificates | [`Apple-Actions/import-codesign-certs@v7`](https://github.com/Apple-Actions/import-codesign-certs) | One `.p12` holding all three identities |
 | Download Provisioning Profiles | [`Apple-Actions/download-provisioning-profiles@v7`](https://github.com/Apple-Actions/download-provisioning-profiles) | No `profile-type`, so it fetches both profiles |
 | Check Provisioning Profiles | `run:` | `jq` over the `profiles` output; fails early if either profile is missing |
-| Archive and Export for App Store | `Apple-Actions/xcodebuild@v1` | `action: archive` with [`ExportOptions.plist`](ExportOptions.plist) |
+| Archive and Export for App Store | `Apple-Actions/xcodebuild@v1` | `action: archive` with [`ExportOptions.plist`](ExportOptions.plist); build number `<run number>.<run attempt>` |
 | Upload TestFlight Build | [`Apple-Actions/upload-testflight-build@v5`](https://github.com/Apple-Actions/upload-testflight-build) | `pkg-path` output, `app-type: macos`, `backend: altool` |
 | Export Developer ID | `Apple-Actions/xcodebuild@v1` | `action: export` of the same archive with [`ExportOptions-DeveloperID.plist`](ExportOptions-DeveloperID.plist) |
-| Package DMG | `run:` | `hdiutil`, then `codesign --timestamp` by certificate hash |
+| Create DMG | [`Apple-Actions/create-dmg@v1`](https://github.com/Apple-Actions/create-dmg) | Checks the app is Developer ID signed, copies it with `ditto`, retries `hdiutil` on `Resource busy`, and signs with the newest Developer ID identity by hash with a timestamp |
 | Notarize DMG | [`Apple-Actions/notarize@v1`](https://github.com/Apple-Actions/notarize) | Submits, waits, staples and verifies |
 | Upload DMG / Create GitHub Release | `actions/upload-artifact@v7`, `gh release create` | Tag `v<MARKETING_VERSION>-<run number>` |
 
@@ -40,7 +40,7 @@ Archiving once and exporting twice means the DMG holds exactly the same binary a
 
 ### Step order
 
-TestFlight runs before the DMG, so an outage at Apple's notary service can't block a TestFlight upload. The trade-off is that re-running a job that failed during notarization uploads to TestFlight again, which fails because the build number already exists. If re-runs must never upload twice, move the Package DMG and Notarize steps above Upload TestFlight Build. Either order works; pick one deliberately.
+TestFlight runs before the DMG, so an outage at Apple's notary service can't block a TestFlight upload. The trade-off is that re-running a job that failed during notarization uploads to TestFlight again. The build number includes `github.run_attempt`, so that re-run uploads a new, higher build instead of failing as a duplicate. If re-runs must never upload twice, move the Create DMG and Notarize DMG steps above Upload TestFlight Build. Either order works; pick one deliberately.
 
 ## The app
 
@@ -92,7 +92,9 @@ To use this for your own app, replace `codes.orj.ExampleMac` and `ER9FN723RR` in
 ## Troubleshooting
 
 - **`error: exportArchive "ExampleMac.app" requires a provisioning profile.`** on Export Developer ID. The `DeveloperID` profile is missing or not mapped in `ExportOptions-DeveloperID.plist`. The archive was signed with the App Store profile, so it carries `com.apple.application-identifier`, and every export of it needs a profile for that method.
-- **`ambiguous` from `codesign`.** Two certificates in the keychain share a name, usually after a renewal. Sign by SHA-1 hash, as the Package DMG step does.
+- **`ExampleMac.app is not signed with Developer ID`** from Create DMG. The app came from the App Store export; pass the Developer ID export's `app-path`.
+- **No Developer ID identity** from Create DMG. The `.p12` is missing Developer ID Application; see step 2 of the setup.
+- **`ambiguous` from `codesign`** when signing by hand. Two certificates in the keychain share a name, usually after a renewal. Sign by SHA-1 hash; `create-dmg` already does.
 - **Notarization `Invalid`.** Read the log that the notarize action prints. Common causes are a missing hardened runtime, an unsigned nested binary, or a signature without a secure timestamp.
 - **TestFlight upload rejects the `.pkg`.** The default `appstore-api` backend only uploads `.ipa` files. Use `backend: altool` or `backend: transporter` for macOS.
 - **Order of TestFlight and the DMG.** See [Step order](#step-order).
